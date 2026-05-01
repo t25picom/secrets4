@@ -86,6 +86,12 @@ some features (master password, vault format, backup) from earlier
 drafts. The current build is the LLM-grant cache described above.
 The design will be updated to match.
 
+## Inspiration
+
+The `$env[NAME]` injection syntax convention is borrowed from
+[scrt4](https://github.com/VestedJosh/scrt4). The rest of secrets4
+is independent design and code.
+
 ## License
 
 MIT
