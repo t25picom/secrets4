@@ -1,3 +1,4 @@
+use crate::audit;
 use crate::cache::{self, CacheRef};
 use crate::cli;
 use crate::paths;
@@ -14,6 +15,13 @@ pub fn run(name: &str) -> Result<i32> {
         lock_path: &lock_path,
     };
     let removed = cache::revoke(&c, name)?;
+    audit::warn_if_failed(audit::record(
+        "revoke",
+        &[
+            ("name", serde_json::json!(name)),
+            ("removed", serde_json::json!(removed)),
+        ],
+    ));
     if removed {
         eprintln!("Revoked {}.", name);
         Ok(cli::EXIT_OK)

@@ -2,7 +2,7 @@
 
 AI-safe local secret-grant cache for LLM-driven workflows.
 
-What you will mostly see here is the real life of ai agents writing iffy code and arguing with each other. 
+What you will mostly see here is the real life of ai agents writing iffy code and arguing with each other.
 
 **Platform:** Unix-like systems. `secrets4` prompts for a strong master
 password to wrap the local cache key.
@@ -38,15 +38,22 @@ ln -s "$(pwd)/target/release/secrets4" /usr/local/bin/secrets4
 # Human:
 printf 'sk-...' | secrets4 grant API_KEY --ttl 8h --stdin
 
-# LLM agent for the next 8 hours:
+# Interactive use prompts for the master password when the cache key
+# must be unwrapped:
 secrets4 run 'curl -H "Authorization: Bearer $env[API_KEY]" https://api.example.com'
+
+# Unattended automation must opt in explicitly:
+SECRETS4_PASSWORD='correct horse battery staple' \
+  secrets4 run 'curl -H "Authorization: Bearer $env[API_KEY]" https://api.example.com'
 ```
 
 On first use, `secrets4` asks you to create and confirm a master
 password. Later commands prompt for that password when they need to
 unwrap the cache key. For non-interactive automation, `SECRETS4_PASSWORD`
 can provide the password explicitly; use that only in environments where
-process environments are protected.
+process environments are protected. Prefer one-shot command prefixes like
+`SECRETS4_PASSWORD=... secrets4 run ...`; avoid `export SECRETS4_PASSWORD=...`
+because exported variables propagate to every child process from that shell.
 
 Tests that need an isolated cache should use
 `SECRETS4_CONFIG_DIR=/tmp/some-dir` rather than overriding `HOME`.
@@ -57,6 +64,7 @@ Tests that need an isolated cache should use
 secrets4 grant NAME [--ttl 2h] [--stdin | --from-file PATH]
 secrets4 revoke NAME
 secrets4 prune
+secrets4 rotate-key
 secrets4 list   [--json]
 secrets4 status [--json]
 secrets4 view NAME            # tty-only; refuses pipes
@@ -77,12 +85,20 @@ secrets4 run 'CMD ... $env[NAME] ...'  [--no-redact]
 `~/.config/secrets4/` (mode `0700`):
 
 - `cache.enc` — ChaCha20-Poly1305-encrypted grant store
-- `cache.key` — Argon2id/password-wrapped 32-byte AEAD key (mode `0600`)
+- `cache.key` — Argon2id/password-wrapped 32-byte AEAD key
+  (`m=256MiB,t=4,p=1`, mode `0600`)
+- `install.id` — non-secret local install identifier bound into `cache.key`
+  AEAD associated data (mode `0600`)
 - `cache.lock` — flock target
 - `audit.log` — NDJSON activity log (no values)
 
 Atomic writes: tmpfile + `fsync` + `rename` + `fsync(parent)` under
 `flock`. Concurrent grants/revokes serialize correctly.
+
+Existing `cache.key`, `cache.enc`, and `install.id` files are checked on
+load for file type, owner, and group/world permission bits. Unsafe modes are
+repaired to `0600` with a warning because prior exposure may already have
+happened.
 
 For tests and one-off smoke runs, `SECRETS4_CONFIG_DIR` may be set to
 override the cache directory.
@@ -104,6 +120,8 @@ Not defended:
   (single-user trust)
 - Full-machine compromise while the master password is available to the
   running user session → out of scope
+- A live automation environment that supplies `SECRETS4_PASSWORD` → out of
+  scope for the master-password gate; the environment becomes the gate
 - Subprocess that base64-encodes / transforms the value before
   printing → byte-exact redaction misses transformed forms
 

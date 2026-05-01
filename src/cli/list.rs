@@ -1,9 +1,23 @@
+use crate::audit;
 use crate::cache::{self, CacheRef};
 use crate::cli;
 use crate::paths;
 use crate::ttl;
 use anyhow::Result;
 use chrono::Utc;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct ListGrant {
+    name: String,
+    expires_at: String,
+    ttl_remaining_secs: i64,
+}
+
+#[derive(Serialize)]
+struct ListOutput {
+    grants: Vec<ListGrant>,
+}
 
 pub fn run(json: bool) -> Result<i32> {
     paths::ensure_config_dir_secure()?;
@@ -17,24 +31,23 @@ pub fn run(json: bool) -> Result<i32> {
     };
     let grants = cache::list(&c)?;
     let now = Utc::now();
+    audit::warn_if_failed(audit::record(
+        "list",
+        &[("count", serde_json::json!(grants.len()))],
+    ));
 
     if json {
-        print!("{{\"grants\":[");
-        let mut first = true;
-        for (name, g) in &grants {
-            if !first {
-                print!(",");
-            }
-            first = false;
-            let remaining = (g.expires_at - now).num_seconds().max(0);
-            print!(
-                "{{\"name\":\"{}\",\"expires_at\":\"{}\",\"ttl_remaining_secs\":{}}}",
-                name,
-                g.expires_at.to_rfc3339(),
-                remaining
-            );
-        }
-        println!("]}}");
+        let out = ListOutput {
+            grants: grants
+                .iter()
+                .map(|(name, g)| ListGrant {
+                    name: name.clone(),
+                    expires_at: g.expires_at.to_rfc3339(),
+                    ttl_remaining_secs: (g.expires_at - now).num_seconds().max(0),
+                })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string(&out)?);
     } else {
         if grants.is_empty() {
             eprintln!("(no active grants)");

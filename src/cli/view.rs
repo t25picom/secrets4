@@ -1,3 +1,4 @@
+use crate::audit;
 use crate::cache::{self, CacheRef};
 use crate::cli;
 use crate::paths;
@@ -23,6 +24,7 @@ pub fn run(name: &str) -> Result<i32> {
     let g = grants
         .get(name)
         .ok_or_else(|| anyhow!("no active grant for {}", name))?;
+    audit::warn_if_failed(audit::record("view", &[("name", serde_json::json!(name))]));
 
     let mut tty = std::fs::OpenOptions::new()
         .write(true)

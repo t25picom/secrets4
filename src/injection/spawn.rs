@@ -1,7 +1,7 @@
 use crate::injection::redact;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, ExitStatus, Stdio};
@@ -37,11 +37,12 @@ fn spawn_inner(
         }
     }
 
-    let mut cmd = Command::new("/bin/bash");
+    let shell = shell_path();
+    let mut cmd = Command::new(&shell);
     cmd.arg("-c").arg(rewritten_cmd).env_clear();
 
     for k in PARENT_ENV_ALLOWLIST {
-        if let Ok(v) = std::env::var(k) {
+        if let Some(v) = std::env::var_os(k) {
             cmd.env(k, v);
         }
     }
@@ -54,7 +55,9 @@ fn spawn_inner(
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
 
-    let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bash: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("spawn {}: {e}", shell.to_string_lossy()))?;
 
     if redact_output {
         let secrets_vec: Vec<(String, Zeroizing<Vec<u8>>)> = secrets.into_iter().collect();
@@ -79,6 +82,10 @@ fn spawn_inner(
     }
 }
 
+fn shell_path() -> OsString {
+    std::env::var_os("SECRETS4_SHELL").unwrap_or_else(|| OsString::from("/bin/sh"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +98,7 @@ mod tests {
         let toks = find_tokens(cmd).unwrap();
         let rewritten = rewrite(cmd, &toks);
 
-        let mut command = Command::new("/bin/bash");
+        let mut command = Command::new(shell_path());
         command
             .arg("-c")
             .arg(&rewritten)
@@ -99,7 +106,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for k in PARENT_ENV_ALLOWLIST {
-            if let Ok(v) = std::env::var(k) {
+            if let Some(v) = std::env::var_os(k) {
                 command.env(k, v);
             }
         }

@@ -2,6 +2,7 @@ pub mod grant;
 pub mod list;
 pub mod prune;
 pub mod revoke;
+pub mod rotate_key;
 pub mod run;
 pub mod status;
 pub mod view;
@@ -36,6 +37,8 @@ pub enum Cmd {
     Revoke { name: String },
     /// Drop expired entries from the cache.
     Prune,
+    /// Rotate the data-encryption key and wrap it with a new master password.
+    RotateKey,
     /// List currently-active grants (names + expiry; never values).
     List {
         #[arg(long)]
@@ -74,6 +77,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         } => grant::run(&name, &ttl, stdin, from_file.as_deref()),
         Cmd::Revoke { name } => revoke::run(&name),
         Cmd::Prune => prune::run(),
+        Cmd::RotateKey => rotate_key::run(),
         Cmd::List { json } => list::run(json),
         Cmd::Status { json } => status::run(json),
         Cmd::View { name } => view::run(&name),

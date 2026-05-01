@@ -11,14 +11,15 @@ use std::os::fd::AsRawFd;
 #[cfg(not(test))]
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 pub use format::{Grant, GrantFile};
 
-const KEY_FILE_MAGIC: &[u8; 4] = b"S4K\x02";
-const LEGACY_KEYCHAIN_KEY_FILE_MAGIC: &[u8; 4] = b"S4K\x01";
+const KEY_FILE_MAGIC: &[u8; 4] = b"S4K\x03";
+const LEGACY_PASSWORD_KEY_FILE_MAGIC: &[u8; 4] = b"S4K\x02";
 const PASSWORD_SALT_LEN: usize = 16;
+const INSTALL_ID_FILE: &str = "install.id";
 
 pub struct CacheRef<'a> {
     pub cache_path: &'a Path,
@@ -31,10 +32,16 @@ pub fn ensure_keyfile(key_path: &Path) -> Result<Zeroizing<[u8; 32]>> {
         validate_keyfile_permissions(key_path)?;
         let bytes = std::fs::read(key_path)?;
         if bytes.starts_with(KEY_FILE_MAGIC) {
-            return open_wrapped_keyfile(&bytes);
+            let install_id = load_install_id(key_path)?;
+            let ad = keyfile_ad(KEY_FILE_MAGIC, &install_id);
+            return open_wrapped_keyfile(&bytes, KEY_FILE_MAGIC, &ad);
         }
-        if bytes.starts_with(LEGACY_KEYCHAIN_KEY_FILE_MAGIC) {
-            let key = open_legacy_keychain_keyfile(&bytes)?;
+        if bytes.starts_with(LEGACY_PASSWORD_KEY_FILE_MAGIC) {
+            let key = open_wrapped_keyfile(
+                &bytes,
+                LEGACY_PASSWORD_KEY_FILE_MAGIC,
+                LEGACY_PASSWORD_KEY_FILE_MAGIC,
+            )?;
             write_wrapped_keyfile(key_path, &key)?;
             return Ok(key);
         }
@@ -67,6 +74,7 @@ fn load_with_key(c: &CacheRef, key: &[u8; aead::KEY_LEN]) -> Result<GrantFile> {
     if !c.cache_path.exists() {
         return Ok(GrantFile::default());
     }
+    validate_cachefile_permissions(c.cache_path)?;
     let bytes = std::fs::read(c.cache_path)?;
     if bytes.len() < format::MAGIC.len() + 12 {
         return Err(anyhow!("cache file truncated"));
@@ -85,20 +93,30 @@ fn load_with_key(c: &CacheRef, key: &[u8; aead::KEY_LEN]) -> Result<GrantFile> {
 }
 
 fn validate_keyfile_permissions(key_path: &Path) -> Result<()> {
-    let meta = std::fs::symlink_metadata(key_path)
-        .with_context(|| format!("stat {}", key_path.display()))?;
+    validate_secure_file(key_path, "cache key file")
+}
+
+fn validate_cachefile_permissions(cache_path: &Path) -> Result<()> {
+    validate_secure_file(cache_path, "cache file")
+}
+
+fn validate_secure_file(path: &Path, label: &str) -> Result<()> {
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if !meta.file_type().is_file() {
         return Err(anyhow!(
-            "cache key file {} is not a regular file",
-            key_path.display()
+            "{} {} is not a regular file",
+            label,
+            path.display()
         ));
     }
 
     let current_uid = nix::unistd::Uid::current().as_raw();
     if meta.uid() != current_uid {
         return Err(anyhow!(
-            "cache key file {} is owned by uid {}, expected {}",
-            key_path.display(),
+            "{} {} is owned by uid {}, expected {}",
+            label,
+            path.display(),
             meta.uid(),
             current_uid
         ));
@@ -107,18 +125,23 @@ fn validate_keyfile_permissions(key_path: &Path) -> Result<()> {
     if meta.permissions().mode() & 0o077 != 0 {
         let mut perms = meta.permissions();
         perms.set_mode(0o600);
-        std::fs::set_permissions(key_path, perms)
-            .with_context(|| format!("chmod 0600 {}", key_path.display()))?;
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        eprintln!(
+            "warning: {} {} had group/world permissions; repaired to 0600, but previous exposure may already have happened",
+            label,
+            path.display()
+        );
     }
 
     Ok(())
 }
 
-fn open_wrapped_keyfile(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    if bytes.len() < KEY_FILE_MAGIC.len() + PASSWORD_SALT_LEN + aead::NONCE_LEN {
+fn open_wrapped_keyfile(bytes: &[u8], magic: &[u8; 4], ad: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    if bytes.len() < magic.len() + PASSWORD_SALT_LEN + aead::NONCE_LEN {
         return Err(anyhow!("cache key file truncated"));
     }
-    let salt_off = KEY_FILE_MAGIC.len();
+    let salt_off = magic.len();
     let salt: [u8; PASSWORD_SALT_LEN] = bytes[salt_off..salt_off + PASSWORD_SALT_LEN]
         .try_into()
         .unwrap();
@@ -129,7 +152,7 @@ fn open_wrapped_keyfile(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let ct = &bytes[nonce_off + aead::NONCE_LEN..];
     let password = wrapping_password(false)?;
     let wrapping_key = derive_wrapping_key(&password, &salt)?;
-    let pt = aead::open(&wrapping_key, &nonce, KEY_FILE_MAGIC, ct)?;
+    let pt = aead::open(&wrapping_key, &nonce, ad, ct)?;
     if pt.len() != aead::KEY_LEN {
         return Err(anyhow!("cache key plaintext has wrong length {}", pt.len()));
     }
@@ -144,11 +167,13 @@ fn write_wrapped_keyfile(key_path: &Path, key: &[u8; aead::KEY_LEN]) -> Result<(
         .ok_or_else(|| anyhow!("key path has no parent"))?;
     std::fs::create_dir_all(parent)?;
 
+    let install_id = load_or_create_install_id(key_path)?;
+    let ad = keyfile_ad(KEY_FILE_MAGIC, &install_id);
     let salt: [u8; PASSWORD_SALT_LEN] = rand::random_bytes();
     let password = wrapping_password(true)?;
     let wrapping_key = derive_wrapping_key(&password, &salt)?;
     let nonce: [u8; aead::NONCE_LEN] = rand::random_bytes();
-    let ct = aead::seal(&wrapping_key, &nonce, KEY_FILE_MAGIC, key)?;
+    let ct = aead::seal(&wrapping_key, &nonce, &ad, key)?;
 
     let mut out =
         Vec::with_capacity(KEY_FILE_MAGIC.len() + PASSWORD_SALT_LEN + aead::NONCE_LEN + ct.len());
@@ -189,6 +214,57 @@ fn write_wrapped_keyfile(key_path: &Path, key: &[u8; aead::KEY_LEN]) -> Result<(
     Ok(())
 }
 
+fn keyfile_ad(magic: &[u8; 4], install_id: &[u8]) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(magic.len() + install_id.len());
+    ad.extend_from_slice(magic);
+    ad.extend_from_slice(install_id);
+    ad
+}
+
+fn install_id_path(key_path: &Path) -> Result<PathBuf> {
+    let parent = key_path
+        .parent()
+        .ok_or_else(|| anyhow!("key path has no parent"))?;
+    Ok(parent.join(INSTALL_ID_FILE))
+}
+
+fn load_install_id(key_path: &Path) -> Result<Vec<u8>> {
+    let path = install_id_path(key_path)?;
+    validate_secure_file(&path, "install id file")?;
+    let id = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    if id.is_empty() {
+        return Err(anyhow!("install id file {} is empty", path.display()));
+    }
+    Ok(id)
+}
+
+fn load_or_create_install_id(key_path: &Path) -> Result<Vec<u8>> {
+    let path = install_id_path(key_path)?;
+    if path.exists() {
+        return load_install_id(key_path);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("install id path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let id = uuid::Uuid::new_v4()
+        .as_hyphenated()
+        .to_string()
+        .into_bytes();
+    let mut f = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(&id)?;
+    f.flush()?;
+    f.sync_all()?;
+    let dir_file = File::open(parent).with_context(|| format!("open dir {}", parent.display()))?;
+    nix::unistd::fsync(dir_file.as_raw_fd()).map_err(|e| anyhow!("dir fsync: {e}"))?;
+    Ok(id)
+}
+
 #[cfg(test)]
 fn derive_wrapping_key(
     _password: &[u8],
@@ -202,7 +278,7 @@ fn derive_wrapping_key(
     password: &[u8],
     salt: &[u8; PASSWORD_SALT_LEN],
 ) -> Result<Zeroizing<[u8; aead::KEY_LEN]>> {
-    let params = argon2::Params::new(64 * 1024, 3, 1, Some(aead::KEY_LEN))
+    let params = argon2::Params::new(256 * 1024, 4, 1, Some(aead::KEY_LEN))
         .map_err(|e| anyhow!("invalid Argon2id params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut key = [0u8; aead::KEY_LEN];
@@ -232,8 +308,8 @@ fn wrapping_password(create: bool) -> Result<Zeroizing<Vec<u8>>> {
 #[cfg(not(test))]
 fn prompt_wrapping_password(create: bool) -> Result<Zeroizing<Vec<u8>>> {
     if create {
-        let p1 = rpassword::prompt_password("Create secrets4 master password: ")?;
-        let p2 = rpassword::prompt_password("Confirm secrets4 master password: ")?;
+        let p1 = rpassword::prompt_password("New secrets4 master password: ")?;
+        let p2 = rpassword::prompt_password("Confirm new secrets4 master password: ")?;
         if p1 != p2 {
             return Err(anyhow!("master passwords did not match"));
         }
@@ -248,12 +324,6 @@ fn prompt_wrapping_password(create: bool) -> Result<Zeroizing<Vec<u8>>> {
         }
         Ok(Zeroizing::new(p.into_bytes()))
     }
-}
-
-fn open_legacy_keychain_keyfile(_bytes: &[u8]) -> Result<Zeroizing<[u8; aead::KEY_LEN]>> {
-    Err(anyhow!(
-        "legacy macOS Keychain-wrapped cache key is not supported by this build"
-    ))
 }
 
 pub fn save(c: &CacheRef, file: &GrantFile) -> Result<()> {
@@ -272,8 +342,8 @@ fn save_with_key_lock(
     file: &GrantFile,
     key: &[u8; aead::KEY_LEN],
 ) -> Result<()> {
-    let mut buf = Vec::new();
-    ciborium::ser::into_writer(file, &mut buf).map_err(|e| anyhow!("encode cache: {e}"))?;
+    let mut buf = Zeroizing::new(Vec::new());
+    ciborium::ser::into_writer(file, &mut *buf).map_err(|e| anyhow!("encode cache: {e}"))?;
     let nonce: [u8; 12] = rand::random_bytes();
     let ct = aead::seal(key, &nonce, format::MAGIC, &buf)?;
 
@@ -303,7 +373,7 @@ pub fn grant(c: &CacheRef, name: &str, value: Zeroizing<Vec<u8>>, ttl_secs: u64)
     file.grants.insert(
         name.to_string(),
         Grant {
-            value: value.to_vec(),
+            value,
             granted_at: now,
             expires_at: expires,
         },
@@ -331,6 +401,20 @@ pub fn prune(c: &CacheRef) -> Result<usize> {
     Ok(pruned)
 }
 
+pub fn rotate_key(c: &CacheRef) -> Result<()> {
+    let lock = atomic::lock_exclusive(c.lock_path)?;
+    if !c.key_path.exists() {
+        return Err(anyhow!(
+            "no cache key exists; grant a secret before rotating"
+        ));
+    }
+    let old_key = ensure_keyfile(c.key_path)?;
+    let file = load_with_key(c, &old_key)?;
+    let new_key: [u8; aead::KEY_LEN] = rand::random_bytes();
+    write_wrapped_keyfile(c.key_path, &new_key)?;
+    save_with_key_lock(c, &lock, &file, &new_key)
+}
+
 pub fn list(c: &CacheRef) -> Result<BTreeMap<String, Grant>> {
     Ok(load(c)?.grants)
 }
@@ -353,7 +437,7 @@ mod tests {
         };
         grant(&r, "FOO", Zeroizing::new(b"bar".to_vec()), 60).unwrap();
         let m = list(&r).unwrap();
-        assert_eq!(m.get("FOO").unwrap().value, b"bar");
+        assert_eq!(m.get("FOO").unwrap().value.as_slice(), b"bar");
     }
 
     #[test]
@@ -371,6 +455,7 @@ mod tests {
         let keyfile = std::fs::read(&kp).unwrap();
         assert!(keyfile.starts_with(KEY_FILE_MAGIC));
         assert_ne!(keyfile.len(), aead::KEY_LEN);
+        assert!(dir.path().join(INSTALL_ID_FILE).exists());
     }
 
     #[test]
@@ -386,6 +471,48 @@ mod tests {
         assert_eq!(&key[..], &[7u8; aead::KEY_LEN]);
         let mode = std::fs::metadata(&kp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn unsafe_existing_cachefile_permissions_are_repaired() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("cache.enc");
+        let kp = dir.path().join("cache.key");
+        let lp = dir.path().join("cache.lock");
+        let r = CacheRef {
+            cache_path: &cp,
+            key_path: &kp,
+            lock_path: &lp,
+        };
+        grant(&r, "FOO", Zeroizing::new(b"bar".to_vec()), 60).unwrap();
+        let mut perms = std::fs::metadata(&cp).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&cp, perms).unwrap();
+
+        let m = list(&r).unwrap();
+        assert_eq!(m.get("FOO").unwrap().value.as_slice(), b"bar");
+        let mode = std::fs::metadata(&cp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn rotate_key_preserves_grants_and_rewrites_keyfile() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("cache.enc");
+        let kp = dir.path().join("cache.key");
+        let lp = dir.path().join("cache.lock");
+        let r = CacheRef {
+            cache_path: &cp,
+            key_path: &kp,
+            lock_path: &lp,
+        };
+        grant(&r, "FOO", Zeroizing::new(b"bar".to_vec()), 60).unwrap();
+        let before = std::fs::read(&kp).unwrap();
+        rotate_key(&r).unwrap();
+        let after = std::fs::read(&kp).unwrap();
+        assert_ne!(before, after);
+        let m = list(&r).unwrap();
+        assert_eq!(m.get("FOO").unwrap().value.as_slice(), b"bar");
     }
 
     #[test]
@@ -411,7 +538,7 @@ mod tests {
         }
         let m = list(&r).unwrap();
         for (i, v) in nasty.iter().enumerate() {
-            assert_eq!(m.get(&format!("S{i}")).unwrap().value, *v);
+            assert_eq!(m.get(&format!("S{i}")).unwrap().value.as_slice(), *v);
         }
     }
 
@@ -430,7 +557,7 @@ mod tests {
         file.grants.insert(
             "OLD".into(),
             Grant {
-                value: b"x".to_vec(),
+                value: Zeroizing::new(b"x".to_vec()),
                 granted_at: Utc::now() - chrono::Duration::seconds(120),
                 expires_at: Utc::now() - chrono::Duration::seconds(60),
             },
@@ -438,7 +565,7 @@ mod tests {
         file.grants.insert(
             "FRESH".into(),
             Grant {
-                value: b"y".to_vec(),
+                value: Zeroizing::new(b"y".to_vec()),
                 granted_at: Utc::now(),
                 expires_at: Utc::now() + chrono::Duration::seconds(60),
             },
@@ -538,7 +665,7 @@ mod tests {
         assert_eq!(grants.len(), 16);
         for i in 0..16 {
             assert_eq!(
-                grants.get(&format!("S{i}")).unwrap().value,
+                grants.get(&format!("S{i}")).unwrap().value.as_slice(),
                 format!("v{i}").as_bytes()
             );
         }

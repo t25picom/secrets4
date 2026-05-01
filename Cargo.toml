@@ -3,7 +3,7 @@ name = "secrets4"
 version = "0.1.0-dev"
 edition = "2021"
 rust-version = "1.78"
-description = "AI-safe local secret vault. Successor to scrt4."
+description = "AI-safe local secret-grant cache. Successor to scrt4."
 license = "MIT"
 
 [[bin]]
@@ -30,6 +30,7 @@ ml-kem = "0.2"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+serde_json = "1"
 ciborium = "0.2"
 
 # CLI

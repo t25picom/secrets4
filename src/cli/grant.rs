@@ -1,3 +1,4 @@
+use crate::audit;
 use crate::cache::{self, CacheRef};
 use crate::cli;
 use crate::paths;
@@ -38,6 +39,13 @@ pub fn run(name: &str, ttl_str: &str, from_stdin: bool, from_file: Option<&Path>
     };
 
     cache::grant(&c, name, value, ttl_secs)?;
+    audit::warn_if_failed(audit::record(
+        "grant",
+        &[
+            ("name", serde_json::json!(name)),
+            ("ttl_secs", serde_json::json!(ttl_secs)),
+        ],
+    ));
     eprintln!(
         "Granted {} for {} ({} secs).",
         name,

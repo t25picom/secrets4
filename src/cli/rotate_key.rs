@@ -14,8 +14,8 @@ pub fn run() -> Result<i32> {
         key_path: &key_path,
         lock_path: &lock_path,
     };
-    let n = cache::prune(&c)?;
-    audit::warn_if_failed(audit::record("prune", &[("pruned", serde_json::json!(n))]));
-    eprintln!("Pruned {} expired grant(s).", n);
+    cache::rotate_key(&c)?;
+    audit::warn_if_failed(audit::record("rotate_key", &[]));
+    eprintln!("Rotated cache encryption key.");
     Ok(cli::EXIT_OK)
 }

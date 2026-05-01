@@ -1,3 +1,4 @@
+use crate::audit;
 use crate::cache::{self, CacheRef};
 use crate::cli;
 use crate::injection::{find_tokens, rewrite, spawn};
@@ -32,7 +33,7 @@ pub fn run(cmd: &str, redact: bool) -> Result<i32> {
     for tok in &tokens {
         match grants.get(&tok.name) {
             Some(g) if g.expires_at > now => {
-                env.insert(tok.name.clone(), Zeroizing::new(g.value.clone()));
+                env.insert(tok.name.clone(), g.value.clone());
             }
             Some(_) => {
                 eprintln!(
@@ -57,5 +58,14 @@ pub fn run(cmd: &str, redact: bool) -> Result<i32> {
     } else {
         spawn::spawn_with_env_no_redact(&rewritten, env)?
     };
-    Ok(status.code().unwrap_or(1))
+    let code = status.code().unwrap_or(1);
+    let names: Vec<_> = tokens.iter().map(|t| t.name.as_str()).collect();
+    audit::warn_if_failed(audit::record(
+        "run",
+        &[
+            ("names", serde_json::json!(names)),
+            ("exit_code", serde_json::json!(code)),
+        ],
+    ));
+    Ok(code)
 }
