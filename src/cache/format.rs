@@ -1,16 +1,27 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use zeroize::Zeroizing;
 
 pub const MAGIC: &[u8; 4] = b"S4C\x01";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Grant {
     #[serde(with = "zeroizing_bytes")]
     pub value: Zeroizing<Vec<u8>>,
     pub granted_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for Grant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Grant")
+            .field("value", &"<redacted>")
+            .field("granted_at", &self.granted_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

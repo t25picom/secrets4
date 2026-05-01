@@ -37,12 +37,17 @@ pub fn ensure_keyfile(key_path: &Path) -> Result<Zeroizing<[u8; 32]>> {
             return open_wrapped_keyfile(&bytes, KEY_FILE_MAGIC, &ad);
         }
         if bytes.starts_with(LEGACY_PASSWORD_KEY_FILE_MAGIC) {
-            let key = open_wrapped_keyfile(
+            eprintln!(
+                "Migrating legacy secrets4 cache key format; reusing the current master password."
+            );
+            let password = wrapping_password(false)?;
+            let key = open_wrapped_keyfile_with_password(
                 &bytes,
                 LEGACY_PASSWORD_KEY_FILE_MAGIC,
                 LEGACY_PASSWORD_KEY_FILE_MAGIC,
+                &password,
             )?;
-            write_wrapped_keyfile(key_path, &key)?;
+            write_wrapped_keyfile_with_password(key_path, &key, &password)?;
             return Ok(key);
         }
         if bytes.len() != 32 {
@@ -52,17 +57,20 @@ pub fn ensure_keyfile(key_path: &Path) -> Result<Zeroizing<[u8; 32]>> {
                 bytes.len()
             ));
         }
-        let mut k = [0u8; 32];
+        eprintln!("Migrating raw secrets4 cache key to password-wrapped format.");
+        let mut k = Zeroizing::new([0u8; aead::KEY_LEN]);
         k.copy_from_slice(&bytes);
         write_wrapped_keyfile(key_path, &k)?;
-        return Ok(Zeroizing::new(k));
+        return Ok(k);
     }
-    let key: [u8; 32] = rand::random_bytes();
+    let key = random_key();
     write_wrapped_keyfile(key_path, &key)?;
-    Ok(Zeroizing::new(key))
+    Ok(key)
 }
 
 pub fn load(c: &CacheRef) -> Result<GrantFile> {
+    let lock = atomic::lock_exclusive(c.lock_path)?;
+    recover_rotation_with_lock(c, &lock)?;
     if !c.cache_path.exists() {
         return Ok(GrantFile::default());
     }
@@ -71,11 +79,31 @@ pub fn load(c: &CacheRef) -> Result<GrantFile> {
 }
 
 fn load_with_key(c: &CacheRef, key: &[u8; aead::KEY_LEN]) -> Result<GrantFile> {
+    load_with_key_prune(c, key, true)
+}
+
+fn load_with_key_unpruned(c: &CacheRef, key: &[u8; aead::KEY_LEN]) -> Result<GrantFile> {
+    load_with_key_prune(c, key, false)
+}
+
+fn load_with_key_prune(
+    c: &CacheRef,
+    key: &[u8; aead::KEY_LEN],
+    prune_expired: bool,
+) -> Result<GrantFile> {
     if !c.cache_path.exists() {
         return Ok(GrantFile::default());
     }
     validate_cachefile_permissions(c.cache_path)?;
-    let bytes = std::fs::read(c.cache_path)?;
+    load_cache_file_with_key(c.cache_path, key, prune_expired)
+}
+
+fn load_cache_file_with_key(
+    cache_path: &Path,
+    key: &[u8; aead::KEY_LEN],
+    prune_expired: bool,
+) -> Result<GrantFile> {
+    let bytes = std::fs::read(cache_path)?;
     if bytes.len() < format::MAGIC.len() + 12 {
         return Err(anyhow!("cache file truncated"));
     }
@@ -88,7 +116,9 @@ fn load_with_key(c: &CacheRef, key: &[u8; aead::KEY_LEN]) -> Result<GrantFile> {
     let pt = aead::open(key, &nonce, format::MAGIC, ct)?;
     let mut file: GrantFile =
         ciborium::de::from_reader(&pt[..]).map_err(|e| anyhow!("decode cache: {e}"))?;
-    file.prune_expired();
+    if prune_expired {
+        file.prune_expired();
+    }
     Ok(file)
 }
 
@@ -138,6 +168,16 @@ fn validate_secure_file(path: &Path, label: &str) -> Result<()> {
 }
 
 fn open_wrapped_keyfile(bytes: &[u8], magic: &[u8; 4], ad: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let password = wrapping_password(false)?;
+    open_wrapped_keyfile_with_password(bytes, magic, ad, &password)
+}
+
+fn open_wrapped_keyfile_with_password(
+    bytes: &[u8],
+    magic: &[u8; 4],
+    ad: &[u8],
+    password: &[u8],
+) -> Result<Zeroizing<[u8; 32]>> {
     if bytes.len() < magic.len() + PASSWORD_SALT_LEN + aead::NONCE_LEN {
         return Err(anyhow!("cache key file truncated"));
     }
@@ -150,18 +190,26 @@ fn open_wrapped_keyfile(bytes: &[u8], magic: &[u8; 4], ad: &[u8]) -> Result<Zero
         .try_into()
         .unwrap();
     let ct = &bytes[nonce_off + aead::NONCE_LEN..];
-    let password = wrapping_password(false)?;
-    let wrapping_key = derive_wrapping_key(&password, &salt)?;
+    let wrapping_key = derive_wrapping_key(password, &salt)?;
     let pt = aead::open(&wrapping_key, &nonce, ad, ct)?;
     if pt.len() != aead::KEY_LEN {
         return Err(anyhow!("cache key plaintext has wrong length {}", pt.len()));
     }
-    let mut key = [0u8; aead::KEY_LEN];
+    let mut key = Zeroizing::new([0u8; aead::KEY_LEN]);
     key.copy_from_slice(&pt[..]);
-    Ok(Zeroizing::new(key))
+    Ok(key)
 }
 
 fn write_wrapped_keyfile(key_path: &Path, key: &[u8; aead::KEY_LEN]) -> Result<()> {
+    let password = wrapping_password(true)?;
+    write_wrapped_keyfile_with_password(key_path, key, &password)
+}
+
+fn write_wrapped_keyfile_with_password(
+    key_path: &Path,
+    key: &[u8; aead::KEY_LEN],
+    password: &[u8],
+) -> Result<()> {
     let parent = key_path
         .parent()
         .ok_or_else(|| anyhow!("key path has no parent"))?;
@@ -170,8 +218,7 @@ fn write_wrapped_keyfile(key_path: &Path, key: &[u8; aead::KEY_LEN]) -> Result<(
     let install_id = load_or_create_install_id(key_path)?;
     let ad = keyfile_ad(KEY_FILE_MAGIC, &install_id);
     let salt: [u8; PASSWORD_SALT_LEN] = rand::random_bytes();
-    let password = wrapping_password(true)?;
-    let wrapping_key = derive_wrapping_key(&password, &salt)?;
+    let wrapping_key = derive_wrapping_key(password, &salt)?;
     let nonce: [u8; aead::NONCE_LEN] = rand::random_bytes();
     let ct = aead::seal(&wrapping_key, &nonce, &ad, key)?;
 
@@ -212,6 +259,104 @@ fn write_wrapped_keyfile(key_path: &Path, key: &[u8; aead::KEY_LEN]) -> Result<(
     let dir_file = File::open(parent).with_context(|| format!("open dir {}", parent.display()))?;
     nix::unistd::fsync(dir_file.as_raw_fd()).map_err(|e| anyhow!("dir fsync: {e}"))?;
     Ok(())
+}
+
+fn write_cache_file_with_key_lock(
+    cache_path: &Path,
+    lock: &atomic::LockGuard,
+    file: &GrantFile,
+    key: &[u8; aead::KEY_LEN],
+) -> Result<()> {
+    let out = encode_cache(file, key)?;
+    atomic::write_with_lock(cache_path, lock, &out)
+}
+
+fn encode_cache(file: &GrantFile, key: &[u8; aead::KEY_LEN]) -> Result<Vec<u8>> {
+    let mut buf = Zeroizing::new(Vec::new());
+    ciborium::ser::into_writer(file, &mut *buf).map_err(|e| anyhow!("encode cache: {e}"))?;
+    let nonce: [u8; 12] = rand::random_bytes();
+    let ct = aead::seal(key, &nonce, format::MAGIC, &buf)?;
+
+    let mut out = Vec::with_capacity(format::MAGIC.len() + 12 + ct.len());
+    out.extend_from_slice(format::MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn staged_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no file name: {}", path.display()))?;
+    let mut staged_name = file_name.to_os_string();
+    staged_name.push(format!(".{suffix}"));
+    Ok(path.with_file_name(staged_name))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn fsync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    let dir_file = File::open(parent).with_context(|| format!("open dir {}", parent.display()))?;
+    nix::unistd::fsync(dir_file.as_raw_fd()).map_err(|e| anyhow!("dir fsync: {e}"))?;
+    Ok(())
+}
+
+fn replace_file(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::rename(src, dst)
+        .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
+    fsync_parent(dst)
+}
+
+fn recover_rotation_with_lock(c: &CacheRef, _lock: &atomic::LockGuard) -> Result<()> {
+    let cache_next = staged_path(c.cache_path, "next")?;
+    let key_next = staged_path(c.key_path, "next")?;
+    if !cache_next.exists() && !key_next.exists() {
+        return Ok(());
+    }
+
+    if c.key_path.exists() {
+        let current_key = ensure_keyfile(c.key_path)?;
+        if cache_next.exists() && load_cache_file_with_key(&cache_next, &current_key, false).is_ok()
+        {
+            replace_file(&cache_next, c.cache_path)?;
+            remove_file_if_exists(&key_next)?;
+            return Ok(());
+        }
+
+        if c.cache_path.exists()
+            && load_cache_file_with_key(c.cache_path, &current_key, false).is_ok()
+        {
+            remove_file_if_exists(&cache_next)?;
+            remove_file_if_exists(&key_next)?;
+            return Ok(());
+        }
+    }
+
+    if cache_next.exists() && key_next.exists() {
+        let next_key = ensure_keyfile(&key_next)?;
+        load_cache_file_with_key(&cache_next, &next_key, false)
+            .context("recover staged cache with staged key")?;
+        replace_file(&key_next, c.key_path)?;
+        replace_file(&cache_next, c.cache_path)?;
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "incomplete key rotation state in {}; cannot recover automatically",
+        c.cache_path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".into())
+    ))
 }
 
 fn keyfile_ad(magic: &[u8; 4], install_id: &[u8]) -> Vec<u8> {
@@ -265,6 +410,12 @@ fn load_or_create_install_id(key_path: &Path) -> Result<Vec<u8>> {
     Ok(id)
 }
 
+fn random_key() -> Zeroizing<[u8; aead::KEY_LEN]> {
+    let mut key = Zeroizing::new([0u8; aead::KEY_LEN]);
+    rand::fill(&mut key[..]);
+    key
+}
+
 #[cfg(test)]
 fn derive_wrapping_key(
     _password: &[u8],
@@ -281,11 +432,11 @@ fn derive_wrapping_key(
     let params = argon2::Params::new(256 * 1024, 4, 1, Some(aead::KEY_LEN))
         .map_err(|e| anyhow!("invalid Argon2id params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut key = [0u8; aead::KEY_LEN];
+    let mut key = Zeroizing::new([0u8; aead::KEY_LEN]);
     argon2
-        .hash_password_into(password, salt, &mut key)
+        .hash_password_into(password, salt, &mut key[..])
         .map_err(|e| anyhow!("derive wrapping key: {e}"))?;
-    Ok(Zeroizing::new(key))
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -342,16 +493,7 @@ fn save_with_key_lock(
     file: &GrantFile,
     key: &[u8; aead::KEY_LEN],
 ) -> Result<()> {
-    let mut buf = Zeroizing::new(Vec::new());
-    ciborium::ser::into_writer(file, &mut *buf).map_err(|e| anyhow!("encode cache: {e}"))?;
-    let nonce: [u8; 12] = rand::random_bytes();
-    let ct = aead::seal(key, &nonce, format::MAGIC, &buf)?;
-
-    let mut out = Vec::with_capacity(format::MAGIC.len() + 12 + ct.len());
-    out.extend_from_slice(format::MAGIC);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ct);
-    atomic::write_with_lock(c.cache_path, lock, &out)
+    write_cache_file_with_key_lock(c.cache_path, lock, file, key)
 }
 
 pub fn grant(c: &CacheRef, name: &str, value: Zeroizing<Vec<u8>>, ttl_secs: u64) -> Result<()> {
@@ -368,6 +510,7 @@ pub fn grant(c: &CacheRef, name: &str, value: Zeroizing<Vec<u8>>, ttl_secs: u64)
         .ok_or_else(|| anyhow!("ttl is too large"))?;
 
     let lock = atomic::lock_exclusive(c.lock_path)?;
+    recover_rotation_with_lock(c, &lock)?;
     let key = ensure_keyfile(c.key_path)?;
     let mut file = load_with_key(c, &key)?;
     file.grants.insert(
@@ -383,6 +526,7 @@ pub fn grant(c: &CacheRef, name: &str, value: Zeroizing<Vec<u8>>, ttl_secs: u64)
 
 pub fn revoke(c: &CacheRef, name: &str) -> Result<bool> {
     let lock = atomic::lock_exclusive(c.lock_path)?;
+    recover_rotation_with_lock(c, &lock)?;
     let key = ensure_keyfile(c.key_path)?;
     let mut file = load_with_key(c, &key)?;
     let removed = file.grants.remove(name).is_some();
@@ -391,18 +535,31 @@ pub fn revoke(c: &CacheRef, name: &str) -> Result<bool> {
 }
 
 pub fn prune(c: &CacheRef) -> Result<usize> {
+    Ok(prune_with_names(c)?.len())
+}
+
+pub fn prune_with_names(c: &CacheRef) -> Result<Vec<String>> {
     let lock = atomic::lock_exclusive(c.lock_path)?;
+    recover_rotation_with_lock(c, &lock)?;
     let key = ensure_keyfile(c.key_path)?;
-    let mut file = load_with_key(c, &key)?;
-    let before = file.grants.len();
-    file.prune_expired();
-    let pruned = before - file.grants.len();
+    let mut file = load_with_key_unpruned(c, &key)?;
+    let now = Utc::now();
+    let pruned: Vec<String> = file
+        .grants
+        .iter()
+        .filter(|(_, grant)| grant.expires_at <= now)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in &pruned {
+        file.grants.remove(name);
+    }
     save_with_key_lock(c, &lock, &file, &key)?;
     Ok(pruned)
 }
 
 pub fn rotate_key(c: &CacheRef) -> Result<()> {
     let lock = atomic::lock_exclusive(c.lock_path)?;
+    recover_rotation_with_lock(c, &lock)?;
     if !c.key_path.exists() {
         return Err(anyhow!(
             "no cache key exists; grant a secret before rotating"
@@ -410,9 +567,13 @@ pub fn rotate_key(c: &CacheRef) -> Result<()> {
     }
     let old_key = ensure_keyfile(c.key_path)?;
     let file = load_with_key(c, &old_key)?;
-    let new_key: [u8; aead::KEY_LEN] = rand::random_bytes();
-    write_wrapped_keyfile(c.key_path, &new_key)?;
-    save_with_key_lock(c, &lock, &file, &new_key)
+    let new_key = random_key();
+    let cache_next = staged_path(c.cache_path, "next")?;
+    let key_next = staged_path(c.key_path, "next")?;
+    write_cache_file_with_key_lock(&cache_next, &lock, &file, &new_key)?;
+    write_wrapped_keyfile(&key_next, &new_key)?;
+    replace_file(&key_next, c.key_path)?;
+    replace_file(&cache_next, c.cache_path)
 }
 
 pub fn list(c: &CacheRef) -> Result<BTreeMap<String, Grant>> {
@@ -456,6 +617,40 @@ mod tests {
         assert!(keyfile.starts_with(KEY_FILE_MAGIC));
         assert_ne!(keyfile.len(), aead::KEY_LEN);
         assert!(dir.path().join(INSTALL_ID_FILE).exists());
+    }
+
+    #[test]
+    fn grant_debug_redacts_value() {
+        let grant = Grant {
+            value: Zeroizing::new(b"super-secret".to_vec()),
+            granted_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(60),
+        };
+        let debug = format!("{grant:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[test]
+    fn legacy_password_keyfile_migrates_reusing_current_password() {
+        let dir = tempdir().unwrap();
+        let kp = dir.path().join("cache.key");
+        let key = [9u8; aead::KEY_LEN];
+        let salt = [1u8; PASSWORD_SALT_LEN];
+        let nonce = [2u8; aead::NONCE_LEN];
+        let wrapping_key = [0x42u8; aead::KEY_LEN];
+        let ct = aead::seal(&wrapping_key, &nonce, LEGACY_PASSWORD_KEY_FILE_MAGIC, &key).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LEGACY_PASSWORD_KEY_FILE_MAGIC);
+        bytes.extend_from_slice(&salt);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ct);
+        std::fs::write(&kp, bytes).unwrap();
+
+        let loaded = ensure_keyfile(&kp).unwrap();
+        assert_eq!(loaded.as_slice(), &key);
+        let migrated = std::fs::read(&kp).unwrap();
+        assert!(migrated.starts_with(KEY_FILE_MAGIC));
     }
 
     #[test]
@@ -516,6 +711,36 @@ mod tests {
     }
 
     #[test]
+    fn recovers_rotation_after_key_swap_before_cache_swap() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("cache.enc");
+        let kp = dir.path().join("cache.key");
+        let lp = dir.path().join("cache.lock");
+        let r = CacheRef {
+            cache_path: &cp,
+            key_path: &kp,
+            lock_path: &lp,
+        };
+        grant(&r, "FOO", Zeroizing::new(b"bar".to_vec()), 60).unwrap();
+
+        let lock = atomic::lock_exclusive(&lp).unwrap();
+        let old_key = ensure_keyfile(&kp).unwrap();
+        let file = load_with_key(&r, &old_key).unwrap();
+        let new_key = random_key();
+        let cache_next = staged_path(&cp, "next").unwrap();
+        let key_next = staged_path(&kp, "next").unwrap();
+        write_cache_file_with_key_lock(&cache_next, &lock, &file, &new_key).unwrap();
+        write_wrapped_keyfile(&key_next, &new_key).unwrap();
+        replace_file(&key_next, &kp).unwrap();
+        drop(lock);
+
+        let m = list(&r).unwrap();
+        assert_eq!(m.get("FOO").unwrap().value.as_slice(), b"bar");
+        assert!(!cache_next.exists());
+        assert!(!key_next.exists());
+    }
+
+    #[test]
     fn nasty_values_round_trip() {
         let dir = tempdir().unwrap();
         let cp = dir.path().join("cache.enc");
@@ -571,6 +796,42 @@ mod tests {
             },
         );
         save(&r, &file).unwrap();
+        let loaded = list(&r).unwrap();
+        assert!(loaded.contains_key("FRESH"));
+        assert!(!loaded.contains_key("OLD"));
+    }
+
+    #[test]
+    fn prune_with_names_reports_expired_grants() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("cache.enc");
+        let kp = dir.path().join("cache.key");
+        let lp = dir.path().join("cache.lock");
+        let r = CacheRef {
+            cache_path: &cp,
+            key_path: &kp,
+            lock_path: &lp,
+        };
+        let mut file = GrantFile::default();
+        file.grants.insert(
+            "OLD".into(),
+            Grant {
+                value: Zeroizing::new(b"x".to_vec()),
+                granted_at: Utc::now() - chrono::Duration::seconds(120),
+                expires_at: Utc::now() - chrono::Duration::seconds(60),
+            },
+        );
+        file.grants.insert(
+            "FRESH".into(),
+            Grant {
+                value: Zeroizing::new(b"y".to_vec()),
+                granted_at: Utc::now(),
+                expires_at: Utc::now() + chrono::Duration::seconds(60),
+            },
+        );
+        save(&r, &file).unwrap();
+        let pruned = prune_with_names(&r).unwrap();
+        assert_eq!(pruned, vec!["OLD"]);
         let loaded = list(&r).unwrap();
         assert!(loaded.contains_key("FRESH"));
         assert!(!loaded.contains_key("OLD"));

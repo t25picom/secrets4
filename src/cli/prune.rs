@@ -14,8 +14,15 @@ pub fn run() -> Result<i32> {
         key_path: &key_path,
         lock_path: &lock_path,
     };
-    let n = cache::prune(&c)?;
-    audit::warn_if_failed(audit::record("prune", &[("pruned", serde_json::json!(n))]));
-    eprintln!("Pruned {} expired grant(s).", n);
+    let names = cache::prune_with_names(&c)?;
+    let count = names.len();
+    audit::warn_if_failed(audit::record(
+        "prune",
+        &[
+            ("pruned", serde_json::json!(count)),
+            ("names", serde_json::json!(names)),
+        ],
+    ));
+    eprintln!("Pruned {} expired grant(s).", count);
     Ok(cli::EXIT_OK)
 }
