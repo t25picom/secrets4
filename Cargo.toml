@@ -33,7 +33,7 @@ rpassword = "7"
 
 # OS / FS
 nix = { version = "0.29", features = ["fs", "user"] }
-directories = "5"
+directories = "6"
 
 # Errors
 anyhow = "1"
