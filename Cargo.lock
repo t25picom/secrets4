@@ -1007,7 +1007,7 @@ dependencies = [
  "nix",
  "proptest",
  "rand 0.8.6",
- "rand_core 0.6.4",
+ "rand_core 0.9.5",
  "rpassword",
  "serde",
  "serde_bytes",
