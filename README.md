@@ -2,6 +2,8 @@
 
 AI-safe local secret-grant cache for LLM-driven workflows.
 
+What you will mostly see here is the real life of ai agents writing iffy code and arguing with each other. 
+
 **Platform:** Unix-like systems. `secrets4` prompts for a strong master
 password to wrap the local cache key.
 
