@@ -342,6 +342,11 @@ fn recover_rotation_with_lock(c: &CacheRef, _lock: &atomic::LockGuard) -> Result
     }
 
     if cache_next.exists() && key_next.exists() {
+        if !c.key_path.exists() {
+            eprintln!(
+                "warning: recovering an interrupted key rotation with the staged cache key; enter the new rotation password if prompted"
+            );
+        }
         let next_key = ensure_keyfile(&key_next)?;
         load_cache_file_with_key(&cache_next, &next_key, false)
             .context("recover staged cache with staged key")?;

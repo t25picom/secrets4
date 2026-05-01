@@ -2,12 +2,14 @@ use crate::cache::atomic;
 use crate::paths;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use serde_json::{Map, Value};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 const MAX_AUDIT_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const AUDIT_ROTATIONS: usize = 4;
 
 pub fn record(event: &str, fields: &[(&str, Value)]) -> Result<()> {
     let path = paths::audit_log()?;
@@ -20,11 +22,14 @@ fn record_at(path: &Path, event: &str, fields: &[(&str, Value)], max_bytes: u64)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let lock_path = path.with_extension("lock");
+    // Lock order is cache.lock -> audit.lock. CLI code currently releases
+    // cache.lock before auditing, but future code must not acquire cache.lock
+    // while holding audit.lock or it can deadlock with cache mutations.
     let _lock = atomic::lock_exclusive(&lock_path)?;
     validate_audit_log(path)?;
     rotate_if_needed(path, max_bytes)?;
 
-    let mut entry = Map::new();
+    let mut entry: BTreeMap<String, Value> = BTreeMap::new();
     entry.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
     entry.insert("event".into(), Value::String(event.into()));
     for (key, value) in fields {
@@ -81,14 +86,27 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> Result<()> {
     if !path.exists() || std::fs::metadata(path)?.len() < max_bytes {
         return Ok(());
     }
-    let rotated = path.with_extension("log.1");
-    match std::fs::remove_file(&rotated) {
+    let oldest = rotated_path(path, AUDIT_ROTATIONS);
+    match std::fs::remove_file(&oldest) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("remove {}", rotated.display())),
+        Err(e) => return Err(e).with_context(|| format!("remove {}", oldest.display())),
     }
-    std::fs::rename(path, &rotated)
-        .with_context(|| format!("rename {} -> {}", path.display(), rotated.display()))?;
+    for generation in (1..AUDIT_ROTATIONS).rev() {
+        let src = rotated_path(path, generation);
+        let dst = rotated_path(path, generation + 1);
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("rename {} -> {}", src.display(), dst.display()));
+            }
+        }
+    }
+    let first = rotated_path(path, 1);
+    std::fs::rename(path, &first)
+        .with_context(|| format!("rename {} -> {}", path.display(), first.display()))?;
     if let Some(parent) = path.parent() {
         let dir =
             std::fs::File::open(parent).with_context(|| format!("open {}", parent.display()))?;
@@ -96,6 +114,10 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> Result<()> {
             .map_err(|e| anyhow!("dir fsync: {e}"))?;
     }
     Ok(())
+}
+
+fn rotated_path(path: &Path, generation: usize) -> std::path::PathBuf {
+    path.with_extension(format!("log.{generation}"))
 }
 
 pub fn warn_if_failed(result: Result<()>) {
@@ -136,5 +158,22 @@ mod tests {
         assert!(path.with_extension("log.1").exists());
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("\"event\":\"status\""));
+    }
+
+    #[test]
+    fn keeps_four_audit_generations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+
+        for i in 0..6 {
+            std::fs::write(&path, format!("full-{i}-log")).unwrap();
+            record_at(&path, "status", &[("i", serde_json::json!(i))], 1).unwrap();
+        }
+
+        assert!(path.with_extension("log.1").exists());
+        assert!(path.with_extension("log.2").exists());
+        assert!(path.with_extension("log.3").exists());
+        assert!(path.with_extension("log.4").exists());
+        assert!(!path.with_extension("log.5").exists());
     }
 }

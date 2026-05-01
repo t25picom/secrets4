@@ -91,7 +91,7 @@ secrets4 run 'CMD ... $env[NAME] ...'  [--no-redact]
   AEAD associated data (mode `0600`)
 - `cache.lock` — flock target
 - `audit.log` — NDJSON activity log (no values), locked during writes and
-  rotated to `audit.log.1` at 10 MiB
+  rotated through `audit.log.1` ... `audit.log.4` at 10 MiB each
 
 Atomic writes: tmpfile + `fsync` + `rename` + `fsync(parent)` under
 `flock`. Concurrent grants/revokes serialize correctly.
@@ -101,10 +101,17 @@ checked for file type, owner, and group/world permission bits. Unsafe modes
 are repaired to `0600` with a warning because prior exposure may already
 have happened.
 
+The audit log lives in the same config directory as the encrypted cache. If
+you copy or back up `~/.config/secrets4/`, you also copy the audit history.
+
 `secrets4 rotate-key` stages the newly encrypted cache and wrapped key under
 the cache lock before swapping them into place. If a crash happens between
 the two renames, the next command completes or discards the staged rotation
 before reading the cache.
+
+All cache reads now take `cache.lock` briefly so interrupted key rotations can
+be recovered safely before any command observes the cache. This is intended
+for single-user CLI workflows rather than heavy concurrent read traffic.
 
 For tests and one-off smoke runs, `SECRETS4_CONFIG_DIR` may be set to
 override the cache directory.
