@@ -3,6 +3,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 pub fn config_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("SECRETS4_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+
     let dirs = directories::ProjectDirs::from("", "", "secrets4")
         .ok_or_else(|| anyhow!("cannot resolve config dir"))?;
     Ok(dirs.config_dir().to_path_buf())

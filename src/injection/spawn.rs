@@ -1,7 +1,9 @@
 use crate::injection::redact;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use zeroize::Zeroizing;
@@ -33,12 +35,6 @@ fn spawn_inner(
         if v.contains(&0u8) {
             return Err(anyhow!("secret {} contains NUL byte; refusing", k));
         }
-        if std::str::from_utf8(v).is_err() {
-            return Err(anyhow!(
-                "secret {} is non-UTF-8; envp on Unix accepts arbitrary bytes but std::process::Command requires OsStr — refusing for v1",
-                k
-            ));
-        }
     }
 
     let mut cmd = Command::new("/bin/bash");
@@ -51,8 +47,7 @@ fn spawn_inner(
     }
 
     for (k, v) in &secrets {
-        let s = std::str::from_utf8(v).expect("checked above");
-        cmd.env(k, s);
+        cmd.env(k, OsStr::from_bytes(v));
     }
 
     if redact_output {
@@ -62,8 +57,7 @@ fn spawn_inner(
     let mut child = cmd.spawn().map_err(|e| anyhow!("spawn bash: {e}"))?;
 
     if redact_output {
-        let secrets_vec: Vec<(String, Zeroizing<Vec<u8>>)> =
-            secrets.into_iter().collect();
+        let secrets_vec: Vec<(String, Zeroizing<Vec<u8>>)> = secrets.into_iter().collect();
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let secrets_clone = secrets_vec.clone();
@@ -110,8 +104,7 @@ mod tests {
             }
         }
         for (k, v) in &secrets {
-            let s = std::str::from_utf8(v).unwrap();
-            command.env(k, s);
+            command.env(k, OsStr::from_bytes(v));
         }
         let out = command.output().unwrap();
         (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
@@ -121,11 +114,14 @@ mod tests {
     fn injects_simple() {
         let mut secrets = HashMap::new();
         secrets.insert("X".to_string(), Zeroizing::new(b"hello world".to_vec()));
-        let (code, stdout, stderr) =
-            run_capture(r#"printf '%s' "$env[X]""#, secrets);
+        let (code, stdout, stderr) = run_capture(r#"printf '%s' "$env[X]""#, secrets);
         assert_eq!(code, 0);
         assert_eq!(stdout, b"hello world");
-        assert!(stderr.is_empty(), "stderr: {:?}", String::from_utf8_lossy(&stderr));
+        assert!(
+            stderr.is_empty(),
+            "stderr: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
     }
 
     #[test]
@@ -136,12 +132,12 @@ mod tests {
             b"'single' \"double\"",
             b"with spaces & semis;",
             b"line1\nline2",
+            b"\xff\xfe binary",
         ];
         for v in nasty {
             let mut secrets = HashMap::new();
             secrets.insert("X".to_string(), Zeroizing::new(v.to_vec()));
-            let (code, stdout, stderr) =
-                run_capture(r#"printf '%s' "$env[X]""#, secrets);
+            let (code, stdout, stderr) = run_capture(r#"printf '%s' "$env[X]""#, secrets);
             assert_eq!(code, 0, "nonzero exit for {:?}", v);
             assert_eq!(stdout, *v, "stdout mismatch for {:?}", v);
             assert!(stderr.is_empty(), "stderr leak for {:?}: {:?}", v, stderr);

@@ -31,9 +31,8 @@ pub fn find_tokens(cmd: &str) -> Result<Vec<Token>, ParseError> {
                 return Err(ParseError::Unterminated(start));
             }
             let name_bytes = &bytes[name_start..j];
-            let name = std::str::from_utf8(name_bytes).map_err(|_| {
-                ParseError::InvalidName(start, "non-utf8 in name".into())
-            })?;
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|_| ParseError::InvalidName(start, "non-utf8 in name".into()))?;
             validate_name(name).map_err(|e| ParseError::InvalidName(start, e))?;
             tokens.push(Token {
                 name: name.to_string(),
@@ -54,7 +53,10 @@ fn validate_name(name: &str) -> Result<(), String> {
     let bytes = name.as_bytes();
     let first = bytes[0];
     if !((first.is_ascii_uppercase()) || first == b'_') {
-        return Err(format!("name must start with [A-Z_], got {:?}", first as char));
+        return Err(format!(
+            "name must start with [A-Z_], got {:?}",
+            first as char
+        ));
     }
     for b in &bytes[1..] {
         if !(b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_') {
@@ -113,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_match_dollar_NAME_form() {
+    fn does_not_match_dollar_name_form() {
         assert!(find_tokens("$NAME and ${NAME}").unwrap().is_empty());
     }
 }

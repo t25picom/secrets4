@@ -1,5 +1,5 @@
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];

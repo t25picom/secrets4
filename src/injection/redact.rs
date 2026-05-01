@@ -17,7 +17,11 @@ impl<'a> Redactor<'a> {
         let mut v: Vec<_> = patterns.into_iter().collect();
         v.sort_by_key(|(_, b)| std::cmp::Reverse(b.len()));
         let max_pat_len = v.first().map(|(_, b)| b.len()).unwrap_or(0);
-        Self { patterns: v, held: Vec::new(), max_pat_len }
+        Self {
+            patterns: v,
+            held: Vec::new(),
+            max_pat_len,
+        }
     }
 
     /// Consume new bytes, return what is safe to emit downstream.
@@ -144,10 +148,7 @@ mod tests {
 
     #[test]
     fn longest_pattern_wins() {
-        let out = redact_all(
-            b"AAABBB end",
-            &[("SHORT", b"AAA"), ("LONG", b"AAABBB")],
-        );
+        let out = redact_all(b"AAABBB end", &[("SHORT", b"AAA"), ("LONG", b"AAABBB")]);
         assert_eq!(out, b"[REDACTED:LONG] end");
     }
 

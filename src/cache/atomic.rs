@@ -1,33 +1,51 @@
 use anyhow::{anyhow, Context, Result};
-use nix::fcntl::{flock, FlockArg};
+use nix::fcntl::{Flock, FlockArg};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-pub fn write_locked(target: &Path, lock_path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = target.parent() {
+pub type LockGuard = Flock<File>;
+
+pub fn lock_exclusive(lock_path: &Path) -> Result<LockGuard> {
+    if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .read(true)
         .mode(0o600)
         .open(lock_path)
         .with_context(|| format!("opening lock {}", lock_path.display()))?;
-    flock(lock_file.as_raw_fd(), FlockArg::LockExclusive)
-        .map_err(|e| anyhow!("flock failed: {e}"))?;
+
+    Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| anyhow!("flock failed: {e}"))
+}
+
+pub fn write_locked(target: &Path, lock_path: &Path, data: &[u8]) -> Result<()> {
+    let lock = lock_exclusive(lock_path)?;
+    write_with_lock(target, &lock, data)
+}
+
+pub fn write_with_lock(target: &Path, _lock: &LockGuard, data: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
 
     let parent = target
         .parent()
         .ok_or_else(|| anyhow!("target has no parent"))?;
     let tmp = parent.join(format!(
         "{}.tmp.{}.{:x}",
-        target.file_name().and_then(|s| s.to_str()).unwrap_or("vault"),
+        target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("vault"),
         std::process::id(),
         crate::crypto::rand::random_bytes::<8>()
             .iter()

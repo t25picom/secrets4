@@ -34,10 +34,7 @@ mod tests {
 
     #[test]
     fn rewrites_multiple() {
-        assert_eq!(
-            rt("echo $env[A] $env[B] $env[C]"),
-            "echo ${A} ${B} ${C}"
-        );
+        assert_eq!(rt("echo $env[A] $env[B] $env[C]"), "echo ${A} ${B} ${C}");
     }
 
     #[test]

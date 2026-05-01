@@ -1,16 +1,20 @@
 pub mod grant;
-pub mod revoke;
-pub mod prune;
 pub mod list;
+pub mod prune;
+pub mod revoke;
+pub mod run;
 pub mod status;
 pub mod view;
-pub mod run;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "secrets4", version, about = "AI-safe secret-grant cache for LLM-driven workflows")]
+#[command(
+    name = "secrets4",
+    version,
+    about = "AI-safe secret-grant cache for LLM-driven workflows"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -62,9 +66,12 @@ pub const EXIT_EXPIRED_OR_NOT_GRANTED: i32 = 65;
 
 pub fn dispatch(cli: Cli) -> Result<i32> {
     match cli.cmd {
-        Cmd::Grant { name, ttl, stdin, from_file } => {
-            grant::run(&name, &ttl, stdin, from_file.as_deref())
-        }
+        Cmd::Grant {
+            name,
+            ttl,
+            stdin,
+            from_file,
+        } => grant::run(&name, &ttl, stdin, from_file.as_deref()),
         Cmd::Revoke { name } => revoke::run(&name),
         Cmd::Prune => prune::run(),
         Cmd::List { json } => list::run(json),

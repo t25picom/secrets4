@@ -5,10 +5,7 @@ pub fn parse_duration(s: &str) -> Result<u64> {
     if s.is_empty() {
         return Err(anyhow!("empty duration"));
     }
-    let (num_str, unit) = s.split_at(
-        s.find(|c: char| c.is_alphabetic())
-            .unwrap_or(s.len()),
-    );
+    let (num_str, unit) = s.split_at(s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len()));
     let n: u64 = num_str
         .parse()
         .map_err(|_| anyhow!("invalid duration number: {num_str}"))?;
@@ -27,11 +24,19 @@ pub fn humanize_remaining(secs: u64) -> String {
     if secs >= 86400 {
         let d = secs / 86400;
         let h = (secs % 86400) / 3600;
-        if h > 0 { format!("{d}d{h}h") } else { format!("{d}d") }
+        if h > 0 {
+            format!("{d}d{h}h")
+        } else {
+            format!("{d}d")
+        }
     } else if secs >= 3600 {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
-        if m > 0 { format!("{h}h{m}m") } else { format!("{h}h") }
+        if m > 0 {
+            format!("{h}h{m}m")
+        } else {
+            format!("{h}h")
+        }
     } else if secs >= 60 {
         format!("{}m", secs / 60)
     } else {
